@@ -1597,6 +1597,42 @@ func (c *Client) getUserResourceBody(a *auth.Auth) (*userResourceResp, error) {
 	return &resp, nil
 }
 
+// CreditBalance 账号积分余额（所有套餐聚合，负值钳 0）。
+// Size 为 0 表示上游未给出周期容量（此时 Remain 即绝对剩余，无法表达百分比）。
+type CreditBalance struct {
+	Remain int64 `json:"remain"`
+	Size   int64 `json:"size"`
+}
+
+// CreditBalance 查询实时积分余额；复用 getUserResourceBody，避免与 UserResourceDetailed
+// 和 ResourceSummary 分叉请求/解析口径。TotalDosage 是累计发放量，不参与 Size 计算。
+func (c *Client) CreditBalance(a *auth.Auth) (CreditBalance, error) {
+	resp, err := c.getUserResourceBody(a)
+	if err != nil {
+		return CreditBalance{}, err
+	}
+	var cr CreditBalance
+	for _, acct := range resp.Response.Data.Accounts {
+		r, _, size := packageRemainUsed(respAccount{
+			CapacityRemain:      acct.CapacityRemain,
+			CapacityUsed:        acct.CapacityUsed,
+			CapacitySize:        acct.CapacitySize,
+			CycleCapacityRemain: acct.CycleCapacityRemain,
+			CycleCapacityUsed:   acct.CycleCapacityUsed,
+			CycleCapacitySize:   acct.CycleCapacitySize,
+		})
+		if r < 0 {
+			r = 0
+		}
+		cr.Remain += r
+		cr.Size += size
+	}
+	if cr.Size < cr.Remain {
+		cr.Size = cr.Remain
+	}
+	return cr, nil
+}
+
 // ResourceSummary 查询账号积分套餐的完整聚合口径（remain=剩余可花积分、used=已用、
 // size=总量、packs=套餐数），供运维工具（cmd/credit）按 realm 展示真实余额。
 // 与 UserResource 的差异：UserResource 只取 remain；本方法额外聚合 used/size/packs，
