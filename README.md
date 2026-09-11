@@ -114,6 +114,10 @@ curl -s http://localhost:7863/healthz
 curl -s http://localhost:7863/v1/models \
   -H "Authorization: Bearer your-api-key"
 
+# 积分余额（实时查上游；聚合 + 每账号）
+curl -s http://localhost:7863/v1/usage \
+  -H "Authorization: Bearer your-api-key"
+
 # 账号状态（汇总 + 每账号详情）
 curl -s http://localhost:7863/status \
   -H "Authorization: Bearer your-api-key"
@@ -343,10 +347,29 @@ curl -s http://localhost:7863/v1/chat/completions \
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
+| `GET /v1/usage` | Bearer（`api_key` 非空时） | 实时积分余额（聚合 + 每账号）；顺手把结果同步回 pool |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+
+`/v1/usage` 响应示例（`remain`/`size` 为池内所有账号的周期积分聚合）：
+
+```json
+{
+  "total": {"remain": 1072, "size": 1100, "used": 28, "accounts": 1, "ok": 1, "failed": 0},
+  "credits": [
+    {"uid": "58c26498-...", "nickname": "Kite", "ok": true, "remain": 1072, "size": 1100, "used": 28}
+  ]
+}
+```
+
+与 `/status` 的 `credits` 区别：`/status` 读的是 pool 缓存值，只在签到（`ReenableIfCredits`）或 `/v1/usage` 同步时更新；
+`/v1/usage` 每次实时查上游。签到关闭（`schedule.checkin_enabled=false`）时 pool 值会长期不动，
+**宿主/面板要余额请用 `/v1/usage`**。单账号查询失败只影响该行（`ok:false` + `error`），整体仍 200；
+失败账号不回写 pool（不会把好余额覆盖成 0）。账号多时并发查询有上限（4），不会一次性打爆上游 billing。
+
+`size` 取周期包容量之和（`TotalDosage` 是累计发放量、只增不减，不参与）；无周期包时 `size: 0`，此时 `remain` 即绝对余额。
 
 `/healthz` 响应示例（200/503 同结构，仅状态码与计数变化）：
 

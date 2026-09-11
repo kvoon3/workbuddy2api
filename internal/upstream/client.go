@@ -441,8 +441,27 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
+// Credit 账号积分余额（所有套餐聚合，负值钳 0）。
+// Size 为 0 表示上游未给出周期容量（此时 Remain 即绝对剩余，无法表达百分比）。
+type Credit struct {
+	Remain int64 `json:"remain"`
+	Size   int64 `json:"size"`
+}
+
+// Credit 账号积分余额，并通过 /status 与 /v1/usage 对外透出。
+// 上游不可达/解析失败时返回错误且不改动池内余额（不把好数据覆盖成 0）。
+func (c *Client) Credit(a *auth.Auth) (Credit, error) {
+	return c.userResource(a)
+}
+
 // UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
 func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
+	cr, err := c.userResource(a)
+	return cr.Remain, err
+}
+
+// userResource 是 Credit 的真实实现（UserResource 保留为单值兼容壳）。
+func (c *Client) userResource(a *auth.Auth) (cr Credit, err error) {
 	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
 	now := time.Now()
 	body := map[string]any{
@@ -456,16 +475,19 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 	raw, _ := json.Marshal(body)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
-		return 0, err
+		return Credit{}, err
 	}
 	BillingHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
-		return 0, err
+		return Credit{}, err
 	}
 	var resp struct {
 		Response struct {
 			Data struct {
+				// TotalDosage 是账号累计发放总量（不是当前周期容量）：实测 1086 vs 周期包合计
+				// 1100，只增不减，拿它算百分比会偏差，故只以周期包容量为准。周期包为空时
+				// Size=0，调用方应把 Remain 当绝对余额展示。
 				Accounts []struct {
 					PackageName         string `json:"PackageName"`
 					CapacitySize        int64  `json:"CapacitySize"`
@@ -479,24 +501,34 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("resource parse: %w", err)
+		return Credit{}, fmt.Errorf("resource parse: %w", err)
 	}
+	var size int64
 	for _, acct := range resp.Response.Data.Accounts {
-		var r int64
+		var r, s int64
 		switch {
 		case acct.CycleCapacitySize > 0:
 			r = acct.CycleCapacityRemain
+			s = acct.CycleCapacitySize
 		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
 			r = acct.CycleCapacityRemain
+			s = acct.CycleCapacitySize
 		default:
 			r = acct.CapacityRemain
+			s = acct.CapacitySize
 		}
 		if r < 0 {
 			r = 0
 		}
-		remain += r
+		cr.Remain += r
+		size += s
 	}
-	return remain, nil
+	// 包容量尚未下发时 size 可能小于 remain，钳住避免百分比为负。
+	if size < cr.Remain {
+		size = cr.Remain
+	}
+	cr.Size = size
+	return cr, nil
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
