@@ -18,6 +18,7 @@ import (
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usage"
 )
 
 func main() {
@@ -35,6 +36,17 @@ func main() {
 			log.Fatalf("load config: %v", err)
 		}
 	}
+
+	usageStore, err := usage.Open(cfg.UsageFile)
+	if err != nil {
+		log.Fatalf("load usage: %v", err)
+	}
+	flushUsage := func() {
+		if err := usageStore.Flush(); err != nil {
+			log.Printf("flush usage: %v", err)
+		}
+	}
+	defer flushUsage()
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
@@ -117,6 +129,8 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		APIKeys:      cfg.APIKeys,
+		Usage:        usageStore,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -126,23 +140,41 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				flushUsage()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+		flushUsage()
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
+	log.Printf("workbuddy2api listening on %s (auth=%v, additional_keys=%d)", cfg.Listen, cfg.APIKey != "" || len(cfg.APIKeys) > 0, len(cfg.APIKeys))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
+	<-shutdownDone
 	log.Printf("bye")
 }

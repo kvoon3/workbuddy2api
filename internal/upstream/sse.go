@@ -203,6 +203,9 @@ func sortInts(a []int) {
 // 空占位 function_call、顶层未知字段），空 delta 键一律省略，
 // usage 缺失 → null，保证任意标准客户端按规范解析。
 func normalizeFrame(obj map[string]any) map[string]any {
+	if obj["error"] != nil {
+		return obj
+	}
 	out := map[string]any{}
 	for _, k := range []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"} {
 		if v, ok := obj[k]; ok && v != nil {

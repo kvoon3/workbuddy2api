@@ -5,17 +5,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"workbuddy2api/internal/apikey"
 )
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	Listen    string       `json:"listen"`  // ":7863"
+	APIKey    string       `json:"api_key"` // 兼容旧 Key；与 api_keys 都为空时不鉴权
+	APIKeys   []apikey.Key `json:"api_keys"`
+	UsageFile string       `json:"usage_file"` // 默认与 state_file 同目录的 usage.json
+	AuthDir   string       `json:"auth_dir"`   // ./auths
+	StateFile string       `json:"state_file"` // ./data/state.json
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -133,6 +138,11 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	applyEnv(c)
+	if v := os.Getenv("WB2A_API_KEYS"); v != "" {
+		if err := json.Unmarshal([]byte(v), &c.APIKeys); err != nil {
+			return nil, fmt.Errorf("WB2A_API_KEYS must be a JSON array of API key objects")
+		}
+	}
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
@@ -151,6 +161,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
+	}
+	if v := os.Getenv("WB2A_USAGE_FILE"); v != "" {
+		c.UsageFile = v
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
@@ -181,7 +194,23 @@ func applyEnv(c *Config) {
 }
 
 func (c *Config) normalize() error {
-	var err error
+	if err := apikey.Validate(c.APIKey, c.APIKeys); err != nil {
+		return err
+	}
+	if c.UsageFile == "" {
+		c.UsageFile = filepath.Join(filepath.Dir(c.StateFile), "usage.json")
+	}
+	usagePath, err := filepath.Abs(c.UsageFile)
+	if err != nil {
+		return fmt.Errorf("usage_file: %w", err)
+	}
+	statePath, err := filepath.Abs(c.StateFile)
+	if err != nil {
+		return fmt.Errorf("state_file: %w", err)
+	}
+	if strings.EqualFold(usagePath, statePath) {
+		return fmt.Errorf("usage_file and state_file must be different files")
+	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
 	}

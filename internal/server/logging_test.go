@@ -38,7 +38,8 @@ func withChatLog(t *testing.T) {
 }
 
 func TestChatStatsReaderTokensFromUsage(t *testing.T) {
-	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now())
+	// Use a known earlier start: coarse platform clocks can report zero elapsed time.
+	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now().Add(-time.Millisecond))
 	if _, err := io.Copy(io.Discard, r); err != nil {
 		t.Fatalf("copy: %v", err)
 	}

@@ -5,7 +5,53 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"workbuddy2api/internal/apikey"
 )
+
+func TestMultiKeyConfigAndEnv(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"api_key":"legacy-secret","api_keys":[{"id":"alice","name":"Alice","key":"alice-secret"}],"state_file":"custom/state.json"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.APIKey != "legacy-secret" || len(c.APIKeys) != 1 || c.APIKeys[0].ID != "alice" || c.UsageFile != filepath.Join("custom", "usage.json") {
+		t.Fatal("multi-key config not loaded")
+	}
+	t.Setenv("WB2A_API_KEYS", `[{"id":"ops","key":"ops-secret","admin":true}]`)
+	t.Setenv("WB2A_USAGE_FILE", "other/usage.json")
+	c, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.APIKeys) != 1 || c.APIKeys[0].ID != "ops" || !c.APIKeys[0].Admin || c.UsageFile != "other/usage.json" {
+		t.Fatal("env override failed")
+	}
+	t.Setenv("WB2A_API_KEYS", `[]`)
+	if c, err = Load(path); err != nil || len(c.APIKeys) != 0 || c.APIKey == "" {
+		t.Fatal("empty list must remove additional keys and preserve legacy key")
+	}
+	t.Setenv("WB2A_API_KEYS", `invalid-secret-config`)
+	if _, err = Load(path); err == nil || strings.Contains(err.Error(), "invalid-secret-config") {
+		t.Fatal("invalid env must fail without leaking contents")
+	}
+}
+
+func TestRejectInvalidAPIKeysAndUsagePath(t *testing.T) {
+	c := Default()
+	c.APIKeys = []apikey.Key{{ID: "a", Key: ""}}
+	if err := c.normalize(); err == nil {
+		t.Fatal("empty key accepted")
+	}
+	c = Default()
+	c.UsageFile = c.StateFile
+	if err := c.normalize(); err == nil {
+		t.Fatal("usage must not overwrite pool state")
+	}
+}
 
 func TestDefault(t *testing.T) {
 	c := Default()

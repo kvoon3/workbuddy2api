@@ -33,6 +33,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 能力 | 说明 |
 |---|---|
 | 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程（无 PKCE），自动落盘凭证并重启容器 |
+| 🔐 **多 API Key 与用量统计** | 独立 Key 身份、管理员查询、按 Key / 模型累计请求与 Token、本地持久化 |
 | 🔄 **多账号池** | 三因子加权随机选号（积分比例 ×10 + 闲置补偿 + 成功率 ×3），Top-5 候选 + 防惊群 |
 | 🛡️ **熔断与冷却** | 429/限流文案软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402/余额不足硬冷却至次日 04:00、连续失败指数退避熔断、在途租约限流 |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑 |
@@ -80,7 +81,7 @@ cd workbuddy2api
 cp config.example.json config.json
 ```
 
-编辑 `config.json`，**至少设置 `api_key`**（`留空 = 不鉴权`，公网部署务必设置）：
+编辑 `config.json`，**至少设置 `api_key` 或 `api_keys`**（两者都为空才不鉴权，公网部署务必设置）：
 
 ```bash
 # 用编辑器把 "api_key" 改成你自己的强随机串
@@ -143,8 +144,10 @@ curl -s http://localhost:7863/v1/chat/completions \
 {
   "listen": ":7863",
   "api_key": "your-api-key-here",
+  "api_keys": [],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "usage_file": "./data/usage.json",
   "cooldown": { "soft_rate": "600s", "soft_rate_max": "2h" },
   "schedule": {
     "checkin_hours": [9, 21],
@@ -176,7 +179,9 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
-| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
+| `api_key` | 空 | 兼容旧版的网关 Key，统计身份为 `legacy`，可查询全部 Key 用量 |
+| `api_keys` | `[]` | 多 Key 列表，元素为 `{ "id": "alice", "name": "Alice", "key": "secret", "admin": false }`；与旧 Key 同时生效 |
+| `usage_file` | `state_file` 同目录的 `usage.json` | 按 Key 的累计用量文件，不能与 `state_file` 相同 |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `cooldown.soft_rate` | `600s` | 软限流（429/限流文案）冷却**基数**；同一账号连续触发按 2 倍指数退避 |
@@ -214,7 +219,48 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`（duration） · `WB2A_SOFT_RATE_MAX`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool）
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_API_KEYS`（JSON 数组，整体替换 `api_keys`） · `WB2A_USAGE_FILE` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`（duration） · `WB2A_SOFT_RATE_MAX`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool）
+
+### 多 API Key 与按 Key 用量
+
+在 `config.json` 中配置后重启服务即可生效（不支持热更新）：
+
+```json
+{
+  "api_key": "replace-with-admin-secret",
+  "api_keys": [
+    {"id": "alice", "name": "Alice", "key": "replace-with-alice-secret"},
+    {"id": "bob", "name": "Bob", "key": "replace-with-bob-secret"}
+  ],
+  "usage_file": "./data/usage.json"
+}
+```
+
+所有 Key 均使用 `Authorization: Bearer <key>`，共享上游账号池。`id` 是稳定的统计标识，只允许 1–64 个英文字母、数字、下划线和连字符；不可重复，也不可使用保留值 `legacy`、`anonymous`。`key` 不能为空、含空白或重复；`name` 可选。改变 Key 密文并保留 `id` 可以轮换凭据并继承历史统计；不同调用方请使用不同 `id`。删除 Key 会撤销访问权限，但保留历史用量。
+
+旧 `api_key` 具有查询全部用量的权限；也可将其留空，在 `api_keys` 中给管理用 Key 配置 `"admin": true`。普通 Key 只能查询自己的 Key 用量；`admin` 仅控制新统计接口的 `scope=all` 权限，既有 `/status`、`/v1/usage` 仍向所有有效 Key 开放。两种 Key 配置都为空时，所有聊天计入 `anonymous`，任意传入的 Authorization 不会创建额外统计身份。
+
+```bash
+# 当前 Key 的统计（管理员默认也只查询自身）
+curl -s http://localhost:7863/v1/usage/keys \
+  -H "Authorization: Bearer replace-with-alice-secret"
+
+# 全部 Key 的统计，包括零用量和已移除的 Key（需要管理员 Key）
+curl -s 'http://localhost:7863/v1/usage/keys?scope=all' \
+  -H "Authorization: Bearer replace-with-admin-secret"
+```
+
+响应为 `{"object":"list","data":[...]}`；每一行包含 `id`、可选 `name`、`requests`、`succeeded`、`failed`、`stream_requests`、`prompt_tokens`、`completion_tokens`、`total_tokens`、`usage_reported_requests`、`usage_missing_requests`、`duration_ms`、`last_used_at` 和 `models`（按请求的模型名细分相同计数）。
+
+统计口径：
+
+- 仅统计鉴权通过且进入 `POST /v1/chat/completions` 的请求，完成时入账；格式错误和最终失败也计数。鉴权失败、查询统计、模型列表、余额查询和健康检查不计数。
+- 流式与非流式均支持；一次请求内部换号重试只记一次，按最终结果计成功/失败。SSE 错误事件、读写错误、空流及已检测到的取消计为失败，即便流式 HTTP 状态已经是 200。
+- Token 取上游最后一份有效 `usage`，不累加重复帧、不估算字符数；缺少 `total_tokens` 时使用输入与输出之和。上游未给出有效用量时增加 `usage_missing_requests`，因此 Token 汇总是已报告的用量，不代表完整账单。失败请求如已读到 `usage` 仍记录其 Token。
+- 这是请求/Token 的累计统计，不是积分扣费统计；原有 `/v1/usage` 继续查询账号池的实时积分余额。
+- 用量每 5 秒原子落盘，正常停机最多等待请求 5 秒后再补写已完成请求；异常退出可能丢失最近一个刷新周期的数据，在途请求尚未计入。数据损坏会拒绝启动，避免静默清零。统计文件仅保存身份、模型和计数，不保存 Key 密文或对话内容。
+- 本地统计文件由单进程使用，不经 Redis 同步；多实例请使用独立文件，不能共写同一文件。默认文件位于 compose 已挂载的 `data/` 中，备份时一并保存。
+- 启用鉴权时，会话粘性按 Key 身份隔离；不同 Key 使用相同 `conversation_id` 不会共享绑定。
 
 ## 🧠 账号池与流量治理
 
@@ -345,13 +391,14 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
-| `GET /v1/usage` | Bearer（`api_key` 非空时） | 实时积分余额（聚合 + 每账号）；顺手把结果同步回 pool |
-| `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
+| `POST /v1/chat/completions` | Bearer（配置任意 Key 时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `GET /v1/models` | Bearer（配置任意 Key 时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
+| `GET /v1/usage` | Bearer（配置任意 Key 时） | 实时积分余额（聚合 + 每账号）；顺手把结果同步回 pool |
+| `GET /v1/usage/keys` | Bearer（配置任意 Key 时） | 当前 Key 的累计请求与 Token；`?scope=all` 仅管理员可用 |
+| `GET /status` | Bearer（配置任意 Key 时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
-> 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+> 鉴权规则：`api_key` 与 `api_keys` 中任意一个有效 Key 均可通过 Bearer 鉴权；**仅在两者都为空时直接放行**；`/healthz` 恒无鉴权。
 
 `/v1/usage` 响应示例（`remain`/`size` 为池内所有账号的周期积分聚合）：
 
@@ -397,7 +444,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 `/status` 挂在鉴权中间件上：只有持有正确 `api_key` 的本网关才会返回 200，旧服务/其他服务
 只会返回 401（或 404）。**注意前提**：本网关 `api_key` 非空才具备这个判别力；
-`api_key` 为空时 `/status` 直接放行，退化为弱校验。
+`api_key` 与 `api_keys` 都为空时 `/status` 直接放行，退化为弱校验。
 
 宿主判定建议：`200` → 健康；`401` → 不是自己的网关（端口被占）；连接失败 → 未就绪；
 `5xx` → 网关已就位但池不可服务（可再叠加 `/healthz` 的 503 语义）。
@@ -528,9 +575,11 @@ cmd/
   signin/    # 批量签到工具
 internal/
   auth/      # 凭证解析 + token 刷新 + 原子写回
+  apikey/    # 网关多 Key 配置校验、鉴权与调用方身份
   pool/      # 账号池（状态机/熔断/租约/加权/持久化）
   scheduler/ # 定时签到 + 保活 + 猫猫旅行巡检
   server/    # HTTP handler + 鉴权 + 请求日志
+  usage/     # 按 Key / 模型累计用量与本地持久化
   session/   # 会话粘性路由
   upstream/  # 上游封装（chat/billing/auth/headers/sse/payload/sanitize/idle）
   redisstore/# Upstash 持久化 + Noop 降级

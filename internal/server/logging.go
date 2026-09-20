@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"workbuddy2api/internal/usage"
 )
 
 // chatSeq 进程级请求序号。
@@ -60,6 +62,10 @@ type chatStatsReader struct {
 	seen     bool // 已见过首个 data 帧（TTFB 只记一次）
 	hasUsage bool // 末帧是否带 usage
 	tokens   int
+	usage    usage.Tokens
+	failed   bool
+	finished bool
+	readErr  error
 	pend     []byte // 已读未返回的行缓存
 }
 
@@ -76,12 +82,16 @@ func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
+	if s.finished {
+		return
+	}
 	line = strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(line, "data: ") {
 		return
 	}
 	payload := strings.TrimPrefix(line, "data: ")
 	if payload == "[DONE]" {
+		s.finished = true
 		return
 	}
 	if !s.seen {
@@ -89,25 +99,62 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.ttfb = time.Since(s.start)
 	}
 	var chunk struct {
+		Error json.RawMessage `json:"error"`
 		Usage *struct {
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens     *int64 `json:"prompt_tokens"`
+			CompletionTokens *int64 `json:"completion_tokens"`
+			TotalTokens      *int64 `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
+	if json.Unmarshal([]byte(payload), &chunk) != nil {
 		return
 	}
+	if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+		s.failed = true
+	}
+	if chunk.Usage == nil {
+		return
+	}
+	u := chunk.Usage
+	if u.PromptTokens == nil && u.CompletionTokens == nil && u.TotalTokens == nil {
+		return
+	}
+	for _, n := range []*int64{u.PromptTokens, u.CompletionTokens, u.TotalTokens} {
+		if n != nil && *n < 0 {
+			return
+		}
+	}
+	var tokens usage.Tokens
+	if u.PromptTokens != nil {
+		tokens.Prompt = *u.PromptTokens
+	}
+	if u.CompletionTokens != nil {
+		tokens.Completion = *u.CompletionTokens
+	}
+	tokens.Total = tokens.Prompt + tokens.Completion
+	if u.TotalTokens != nil {
+		tokens.Total = *u.TotalTokens
+	}
 	s.hasUsage = true
-	s.tokens = chunk.Usage.CompletionTokens
+	s.usage = tokens
+	s.tokens = int(tokens.Completion)
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
 func (s *chatStatsReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if len(s.pend) > 0 {
 		n := copy(p, s.pend)
 		s.pend = s.pend[n:]
 		return n, nil
 	}
+	if s.readErr != nil {
+		return 0, s.readErr
+	}
 	line, err := s.br.ReadString('\n')
+	s.readErr = err
 	if line != "" {
 		s.parseSSELine(line)
 		s.pend = []byte(line)

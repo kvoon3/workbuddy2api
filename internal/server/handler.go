@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,18 +13,22 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/apikey"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usage"
 )
 
 // Config handler 依赖。
 type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	APIKey    string // 兼容旧 Key；仅 APIKey 与 APIKeys 都为空时不鉴权
+	APIKeys   []apikey.Key
+	Usage     *usage.Store
+	MaxRotate int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -47,12 +52,20 @@ const ServiceName = "workbuddy2api"
 
 // Handler 主路由。
 type Handler struct {
-	cfg Config
-	mux *http.ServeMux
+	cfg  Config
+	mux  *http.ServeMux
+	keys *apikey.Authenticator
 }
 
 // NewHandler 构建 handler。
 func NewHandler(cfg Config) *Handler {
+	keys, err := apikey.New(cfg.APIKey, cfg.APIKeys)
+	if err != nil {
+		panic(err)
+	} // 配置错误必须拒绝启动；主程序在 Load 时已校验。
+	if cfg.Usage == nil {
+		cfg.Usage, _ = usage.Open("")
+	}
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3
 	}
@@ -62,10 +75,11 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), keys: keys}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /v1/usage", h.withAuth(h.usage))
+	h.mux.HandleFunc("GET /v1/usage/keys", h.withAuth(h.keyUsage))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
@@ -75,17 +89,62 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+type identityContextKey struct{}
+
+func requestIdentity(r *http.Request) apikey.Identity {
+	id, _ := r.Context().Value(identityContextKey{}).(apikey.Identity)
+	return id
+}
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.APIKey != "" {
-			authz := r.Header.Get("Authorization")
-			if !strings.HasPrefix(authz, "Bearer ") || strings.TrimPrefix(authz, "Bearer ") != h.cfg.APIKey {
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-				return
+		identity, ok := h.keys.Authenticate(r.Header.Get("Authorization"))
+		if !ok {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), identityContextKey{}, identity)))
+	}
+}
+
+// keyUsage reports the caller's counters; only administrators may request all keys.
+func (h *Handler) keyUsage(w http.ResponseWriter, r *http.Request) {
+	id := requestIdentity(r)
+	scope := r.URL.Query().Get("scope")
+	if scope != "" && scope != "self" && scope != "all" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_scope", "scope must be self or all")
+		return
+	}
+	if scope == "all" && !id.Admin {
+		writeOpenAIError(w, http.StatusForbidden, "forbidden", "admin API key required")
+		return
+	}
+	identities := map[string]apikey.Identity{}
+	for _, identity := range h.keys.Identities() {
+		identities[identity.ID] = identity
+	}
+	ids := []string{id.ID}
+	if scope == "all" {
+		for _, entry := range h.cfg.Usage.Entries(nil) {
+			if _, ok := identities[entry.ID]; !ok {
+				identities[entry.ID] = apikey.Identity{ID: entry.ID}
 			}
 		}
-		next(w, r)
+		ids = make([]string, 0, len(identities))
+		for keyID := range identities {
+			ids = append(ids, keyID)
+		}
 	}
+	type row struct {
+		usage.Entry
+		Name string `json:"name,omitempty"`
+	}
+	data := make([]row, 0, len(ids))
+	for _, entry := range h.cfg.Usage.Entries(ids) {
+		data = append(data, row{entry, identities[entry.ID].Name})
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -313,15 +372,30 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	record := usage.Record{ID: requestIdentity(r).ID, Model: "-"}
+	started := time.Now()
+	defer func() {
+		record.Duration = time.Since(started)
+		h.cfg.Usage.Record(record)
+	}()
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		status := http.StatusBadRequest
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeOpenAIError(w, status, "invalid_request", "read body: "+err.Error())
 		return
 	}
 	var peek struct {
 		Stream bool `json:"stream"`
 	}
-	_ = json.Unmarshal(body, &peek)
+	if err := json.Unmarshal(body, &peek); err != nil || strings.TrimSpace(string(body)) == "null" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "request body must be a JSON object")
+		return
+	}
+	record.Model, record.Stream = parseModelFromBody(body), peek.Stream
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -336,6 +410,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Session != nil {
 		sessKey = session.ExtractKey(body)
 		if sessKey != "" {
+			if id := requestIdentity(r).ID; id != "anonymous" && id != "" {
+				sessKey = id + ":" + sessKey
+			}
 			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
 				stickyUID = uid
 			}
@@ -443,21 +520,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			_ = upstream.Stream(w, stats)
+			streamErr := upstream.Stream(w, stats)
+			record.Success = streamErr == nil && !stats.failed && r.Context().Err() == nil
+			record.Tokens, record.HasUsage = stats.usage, stats.hasUsage
 			st.ttfb = stats.TTFB()
-			st.toks, _ = stats.Tokens()
+			if toks, ok := stats.Tokens(); ok {
+				st.toks = toks
+			}
 			rc.Close()
 			return
 		}
-		resp, err := upstream.Aggregate(rc)
+		stats := newChatStatsReaderSince(rc, st.start)
+		resp, err := upstream.Aggregate(stats)
+		record.Tokens, record.HasUsage = stats.usage, stats.hasUsage
 		rc.Close()
-		if err != nil {
+		if err != nil || stats.failed {
+			if err == nil {
+				err = errors.New("upstream returned an error event")
+			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
 		}
-		writeJSON(w, http.StatusOK, resp)
+		writeErr := writeJSON(w, http.StatusOK, resp)
+		record.Success = writeErr == nil && r.Context().Err() == nil
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
 		return
@@ -513,11 +600,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
 // helpers
 // ---------------------------------------------------------------------------
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func writeJSON(w http.ResponseWriter, status int, v any) error {
 	raw, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(raw)
+	_, err := w.Write(raw)
+	return err
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
