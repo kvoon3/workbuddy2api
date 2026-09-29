@@ -249,6 +249,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		AuthHTMLPath: filepath.Join(filepath.Dir(*cfgPath), "auth.html"),
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,

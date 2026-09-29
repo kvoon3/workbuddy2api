@@ -1956,6 +1956,26 @@ func TestHealthzServiceIdentity(t *testing.T) {
 
 // TestHealthzServiceIdentityWithoutAuth /healthz 保持无鉴权（负载均衡友好）：
 // 配了 api_key 也不要求 Bearer，身份字段照常返回。
+func TestAuthHTMLServedFromConfiguredPath(t *testing.T) {
+	path := t.TempDir() + "/auth.html"
+	if err := os.WriteFile(path, []byte("<h1>local keys</h1>"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: pool.New(""), Upstream: upstream.New(), AuthHTMLPath: path})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/auth.html", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "<h1>local keys</h1>" {
+		t.Fatalf("GET /auth.html = %d %q", rec.Code, rec.Body.String())
+	}
+
+	h = NewHandler(Config{Pool: pool.New(""), Upstream: upstream.New()})
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/auth.html", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("disabled GET /auth.html = %d, want 404", rec.Code)
+	}
+}
+
 func TestHealthzServiceIdentityWithoutAuth(t *testing.T) {
 	h := NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
@@ -2526,7 +2546,7 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 }
 
 // TestStaleSnapshotBoundedByPickGate 粘性快照陈旧被 Pick 闸兜底的契约锚
-//（pr134-watchlist-analysis.md #10）：
+// （pr134-watchlist-analysis.md #10）：
 // session.ResolveForModel 在取任何锁之前拿 pool 可用性快照——若快照后、Pick 前
 // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
 // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定
